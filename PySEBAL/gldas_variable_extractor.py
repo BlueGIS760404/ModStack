@@ -1,4 +1,4 @@
-himport os
+import os
 os.environ['XARRAY_NO_DASK'] = '1'
 os.environ['PROJ_LIB'] = r'C:\Users\Reza\anaconda3\envs\gldas_env\Library\share\proj'
 
