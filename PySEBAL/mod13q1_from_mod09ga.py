@@ -6,100 +6,132 @@ gdal_translate "HDF4_EOS:EOS_GRID:MOD09GA.hdf:MODIS_Grid_500m_2D:sur_refl_b02_1"
 import os
 import subprocess
 
-# Directory where the input HDF files are located
-input_dir = 'D:/Module11/PySEBAL_data/Satellite_data'  # you can change this to your folder path
-# Directory where the output TIFF files will be saved
-output_dir = 'osgeo4w'
+# === Configure your input and output directories ===
+input_dir = r'C:\Users\Reza'  # Path to HDF files
+output_dir = r'C:\Users\Reza\bands_1_2'  # Output GeoTIFFs
 
-# Make sure output directory exists
 os.makedirs(output_dir, exist_ok=True)
 
-# Band info to extract
-bands = {
-    'band1': 'sur_refl_b01_1',
-    'band2': 'sur_refl_b02_1'
+# === Define the subdatasets you want to extract ===
+layers = {
+    'band1': ('MODIS_Grid_500m_2D', 'sur_refl_b01_1'),
+    'band2': ('MODIS_Grid_500m_2D', 'sur_refl_b02_1'),
+    'state_1km': ('MODIS_Grid_1km_2D', 'state_1km_1')  # 1km QA layer
 }
 
-# Find all HDF files containing "MOD09GA"
+# === Loop through all HDF files ===
 for filename in os.listdir(input_dir):
     if filename.endswith('.hdf') and 'MOD09GA' in filename:
         base_name = os.path.splitext(filename)[0]
         input_path = os.path.join(input_dir, filename)
-        
-        for band_key, band_name in bands.items():
-            output_filename = f"{base_name}_{band_key}.tif"
-            output_path = os.path.join(output_dir, output_filename)
-            
-            gdal_path = "gdal_translate"  # Make sure gdal_translate is in your PATH
-            # Construct the GDAL subdataset string
-            subdataset = f'HDF4_EOS:EOS_GRID:{input_path}:MODIS_Grid_500m_2D:{band_name}'
-            
-            cmd = [gdal_path, subdataset, output_path]
-            print("Running command:", ' '.join(cmd))
-            subprocess.run(cmd, check=True)
+        print(f"\n📂 Processing {filename}")
 
-print("Done extracting bands.")
+        for key, (grid, subdataset_name) in layers.items():
+            output_filename = f"{base_name}_{key}.tif"
+            output_path = os.path.join(output_dir, output_filename)
+
+            subdataset = f'HDF4_EOS:EOS_GRID:{input_path}:{grid}:{subdataset_name}'
+            cmd = ['gdal_translate', subdataset, output_path]
+
+            print(f"➡️  Extracting {key} → {output_filename}")
+            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+            if result.returncode != 0:
+                print(f"❌ Error extracting {key}:\n{result.stderr.strip()}")
+            else:
+                print(f"✅ Saved: {output_filename}")
+
+print("\n🎉 Done extracting Band 1, Band 2, and state_1km for all files.")
 
 # Calculating NDVI ------------------------------------------------------------------------------------------------------------------------------------------------
 import os
 import numpy as np
 import rasterio
-import matplotlib.pyplot as plt
+from rasterio.enums import Resampling
 
-def calculate_ndvi(red_band_path, nir_band_path, output_path):
+def calculate_ndvi_with_relaxed_mask(red_path, nir_path, qa_path, output_path):
     """
-    Calculate NDVI from Red and NIR bands, scale to [0,1], and save as float32 GeoTIFF.
+    Calculate NDVI with relaxed masking: exclude only QA pixels with bits 0-1 == 11,
+    and scale to [-2000, 10000]. Output is int16 GeoTIFF with nodata = -3000.
     """
-    with rasterio.open(red_band_path) as red_src:
+
+    # Read red band
+    with rasterio.open(red_path) as red_src:
         red = red_src.read(1).astype('float32')
         profile = red_src.profile.copy()
+        red_shape = red.shape
 
-    with rasterio.open(nir_band_path) as nir_src:
+    # Read NIR band
+    with rasterio.open(nir_path) as nir_src:
         nir = nir_src.read(1).astype('float32')
 
-        if red_src.crs != nir_src.crs:
-            print(f"⚠️ CRS mismatch between {os.path.basename(red_band_path)} and {os.path.basename(nir_band_path)}.")
-        if red_src.transform != nir_src.transform:
-            print(f"⚠️ Transform mismatch between {os.path.basename(red_band_path)} and {os.path.basename(nir_band_path)}.")
+    # Read QA band and resample to match 500m bands (state_1km is 1km resolution)
+    with rasterio.open(qa_path) as qa_src:
+        qa = qa_src.read(1, out_shape=red_shape, resampling=Resampling.nearest)
 
+    # Define nodata value
+    nodata_val = -3000
+
+    # QA bitmask filtering — only exclude pixels with bits 0-1 == 11 (invalid)
+    cloud_bits = qa & 0b11
+    valid_qa_mask = cloud_bits != 0b11
+
+    # NDVI calculation: (NIR - Red) / (NIR + Red)
     denominator = nir + red
-    valid_mask = (denominator != 0) & (~np.isinf(red)) & (~np.isinf(nir)) & (~np.isnan(red)) & (~np.isnan(nir))
+    with np.errstate(divide='ignore', invalid='ignore'):
+        ndvi = np.where(
+            (denominator != 0) & valid_qa_mask,
+            (nir - red) / denominator,
+            np.nan
+        )
 
-    ndvi = np.full_like(red, -2.0, dtype=np.float32)
-    ndvi[valid_mask] = (nir[valid_mask] - red[valid_mask]) / denominator[valid_mask]
+    # Clip NDVI to [-1, 1] to avoid outliers
     ndvi = np.clip(ndvi, -1.0, 1.0)
-    ndvi_scaled = (ndvi + 1) / 2
-    ndvi_scaled[~valid_mask] = 0.0
 
+    # Scale NDVI to [-2000, 10000] linearly
+    ndvi_scaled = ((ndvi + 1) / 2) * 12000 - 2000  # full range: 12000
+
+    # Diagnostics
+    total = ndvi_scaled.size
+    nodata_pixels = np.sum(np.isnan(ndvi_scaled))
+    valid_pixels = total - nodata_pixels
+    cloudy_pixels = np.sum(cloud_bits == 0b11)
+
+    print(f"📊 Valid NDVI pixels: {valid_pixels}/{total} ({(valid_pixels / total) * 100:.2f}%)")
+    print(f"☁️ Cloudy pixels excluded (bits 11): {cloudy_pixels} ({(cloudy_pixels / total) * 100:.2f}%)")
+
+    # Replace NaNs with nodata and convert to int16
+    ndvi_scaled = np.where(np.isnan(ndvi_scaled), nodata_val, ndvi_scaled).astype(np.int16)
+
+    # Update profile for output GeoTIFF
     profile.update(
-        dtype=rasterio.float32,
+        dtype=rasterio.int16,
         count=1,
-        nodata=0.0,
+        nodata=nodata_val,
         compress='lzw'
     )
 
-    # ✅ Use correct output file path here
+    # Save output
     with rasterio.open(output_path, 'w', **profile) as dst:
         dst.write(ndvi_scaled, 1)
 
-    print(f"✅ NDVI saved: {os.path.basename(output_path)}")
+    print(f"✅ NDVI saved: {os.path.basename(output_path)}\n")
 
 if __name__ == "__main__":
-    input_dir = 'D:/Module11/PySEBAL_data/Satellite_data/bands_1_2'
-    output_dir = 'D:/Module11/PySEBAL_data/Satellite_data/ndvi'
+    input_dir = r'C:\Users\Reza\bands_1_2'
+    output_dir = r'C:\Users\Reza\bands_1_2\ndvi'
 
-    os.makedirs(output_dir, exist_ok=True)  # Ensure output directory exists
+    os.makedirs(output_dir, exist_ok=True)
 
     for fname in os.listdir(input_dir):
-        if fname.endswith('_band1.tif') and fname.startswith('MOD09GA'):
+        if fname.endswith('_band1.tif') and 'MOD09GA' in fname:
             band1_path = os.path.join(input_dir, fname)
-            band2_fname = fname.replace('_band1.tif', '_band2.tif')
-            band2_path = os.path.join(input_dir, band2_fname)
+            band2_path = os.path.join(input_dir, fname.replace('_band1.tif', '_band2.tif'))
+            qa_path = os.path.join(input_dir, fname.replace('_band1.tif', '_state_1km.tif'))
 
-            if os.path.exists(band2_path):
-                ndvi_fname = fname.replace('_band1.tif', '_ndvi.tif')
-                ndvi_path = os.path.join(output_dir, ndvi_fname)  # ✅ Save to output folder
+            if os.path.exists(band2_path) and os.path.exists(qa_path):
+                ndvi_path = os.path.join(output_dir, fname.replace('_band1.tif', '_ndvi.tif'))
                 print(f"🔄 Calculating NDVI for {fname}")
-                calculate_ndvi(band1_path, band2_path, ndvi_path)
+                calculate_ndvi_with_relaxed_mask(band1_path, band2_path, qa_path, ndvi_path)
             else:
-                print(f"❌ Band2 file not found for {fname}")
+                print(f"❌ Missing band2 or QA for {fname}")
